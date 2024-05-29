@@ -37,6 +37,7 @@
 #include <linux/fadvise.h>
 #include <linux/mount.h>
 #include <linux/filelock.h>
+#include <linux/fsverity.h>
 
 static const struct vm_operations_struct xfs_file_vm_ops;
 
@@ -245,60 +246,6 @@ static const struct iomap_dio_ops xfs_dio_read_bounce_ops = {
 };
 
 STATIC ssize_t
-xfs_file_dio_read(
-	struct kiocb		*iocb,
-	struct iov_iter		*to)
-{
-	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
-	unsigned int		dio_flags = 0;
-	const struct iomap_dio_ops *dio_ops = NULL;
-	ssize_t			ret;
-
-	trace_xfs_file_direct_read(iocb, to);
-
-	if (!iov_iter_count(to))
-		return 0; /* skip atime */
-
-	file_accessed(iocb->ki_filp);
-
-	ret = xfs_ilock_iocb(iocb, XFS_IOLOCK_SHARED);
-	if (ret)
-		return ret;
-	if (mapping_stable_writes(iocb->ki_filp->f_mapping)) {
-		dio_ops = &xfs_dio_read_bounce_ops;
-		dio_flags |= IOMAP_DIO_BOUNCE;
-	}
-	ret = iomap_dio_rw(iocb, to, &xfs_read_iomap_ops, dio_ops, dio_flags,
-			NULL, 0);
-	xfs_iunlock(ip, XFS_IOLOCK_SHARED);
-
-	return ret;
-}
-
-static noinline ssize_t
-xfs_file_dax_read(
-	struct kiocb		*iocb,
-	struct iov_iter		*to)
-{
-	struct xfs_inode	*ip = XFS_I(iocb->ki_filp->f_mapping->host);
-	ssize_t			ret = 0;
-
-	trace_xfs_file_dax_read(iocb, to);
-
-	if (!iov_iter_count(to))
-		return 0; /* skip atime */
-
-	ret = xfs_ilock_iocb(iocb, XFS_IOLOCK_SHARED);
-	if (ret)
-		return ret;
-	ret = dax_iomap_rw(iocb, to, &xfs_read_iomap_ops);
-	xfs_iunlock(ip, XFS_IOLOCK_SHARED);
-
-	file_accessed(iocb->ki_filp);
-	return ret;
-}
-
-STATIC ssize_t
 xfs_file_buffered_read(
 	struct kiocb		*iocb,
 	struct iov_iter		*to)
@@ -318,6 +265,72 @@ xfs_file_buffered_read(
 }
 
 STATIC ssize_t
+xfs_file_dio_read(
+	struct kiocb		*iocb,
+	struct iov_iter		*to)
+{
+	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
+	unsigned int		dio_flags = 0;
+	const struct iomap_dio_ops *dio_ops = NULL;
+	ssize_t			ret;
+
+	trace_xfs_file_direct_read(iocb, to);
+
+	if (!iov_iter_count(to))
+		return 0; /* skip atime */
+
+	file_accessed(iocb->ki_filp);
+
+	ret = xfs_ilock_iocb(iocb, XFS_IOLOCK_SHARED);
+	if (ret)
+		return ret;
+
+	/*
+	 * Re-check verity status after acquiring lock. This prevents TOCTOU in
+	 * xfs_file_read_iter() while falling back from DIO to buffered I/O as
+	 * now we are holding a lock
+	 */
+	if (fsverity_active(VFS_I(ip))) {
+		xfs_iunlock(ip, XFS_IOLOCK_SHARED);
+		iocb->ki_flags &= ~IOCB_DIRECT;
+		return xfs_file_buffered_read(iocb, to);
+	}
+	if (mapping_stable_writes(iocb->ki_filp->f_mapping)) {
+		dio_ops = &xfs_dio_read_bounce_ops;
+		dio_flags |= IOMAP_DIO_BOUNCE;
+	}
+	ret = iomap_dio_rw(iocb, to, &xfs_read_iomap_ops, dio_ops, dio_flags,
+			NULL, 0);
+	xfs_iunlock(ip, XFS_IOLOCK_SHARED);
+
+	return ret;
+}
+
+static noinline ssize_t
+xfs_file_dax_read(
+	struct kiocb		*iocb,
+	struct iov_iter		*to)
+{
+	struct inode		*inode = iocb->ki_filp->f_mapping->host;
+	struct xfs_inode	*ip = XFS_I(inode);
+	ssize_t			ret = 0;
+
+	trace_xfs_file_dax_read(iocb, to);
+
+	if (!iov_iter_count(to))
+		return 0; /* skip atime */
+
+	ret = xfs_ilock_iocb(iocb, XFS_IOLOCK_SHARED);
+	if (ret)
+		return ret;
+	ret = dax_iomap_rw(iocb, to, &xfs_read_iomap_ops);
+	xfs_iunlock(ip, XFS_IOLOCK_SHARED);
+
+	file_accessed(iocb->ki_filp);
+	return ret;
+}
+
+STATIC ssize_t
 xfs_file_read_iter(
 	struct kiocb		*iocb,
 	struct iov_iter		*to)
@@ -330,6 +343,14 @@ xfs_file_read_iter(
 
 	if (xfs_is_shutdown(mp))
 		return -EIO;
+
+	/*
+	 * In case fs-verity is enabled, we also fallback to the buffered read
+	 * from the direct read path. Therefore, IOCB_DIRECT is set and need to
+	 * be cleared (see generic_file_read_iter())
+	 */
+	if (fsverity_active(inode))
+		iocb->ki_flags &= ~IOCB_DIRECT;
 
 	if (IS_DAX(inode))
 		ret = xfs_file_dax_read(iocb, to);
