@@ -454,6 +454,7 @@ struct iomap_ioend {
 	sector_t		io_sector;	/* start sector of ioend */
 	void			*io_private;	/* file system private data */
 	struct fsverity_info	*io_vi;		/* fsverity info */
+	struct work_struct	io_work;	/* fsverity blocking I/O */
 	struct bio		io_bio;		/* MUST BE LAST! */
 };
 

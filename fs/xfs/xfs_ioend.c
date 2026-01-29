@@ -16,14 +16,54 @@
 #include "xfs_reflink.h"
 #include "xfs_zone_alloc.h"
 #include "xfs_ioend.h"
+#include "xfs_error.h"
+#include "xfs_errortag.h"
+#include "xfs_fsverity.h"
 #include <linux/bio-integrity.h>
+#include <linux/fsverity.h>
+
+static void
+xfs_end_fsverity_io_read(
+	struct work_struct	*work)
+{
+	struct iomap_ioend	*ioend =
+		container_of(work, struct iomap_ioend, io_work);
+
+	if (!ioend->io_bio.bi_status)
+		fsverity_verify_bio(ioend->io_vi, &ioend->io_bio);
+
+	iomap_finish_ioends(
+		ioend, blk_status_to_errno(ioend->io_bio.bi_status));
+}
 
 static void
 xfs_end_io_read(
 	struct bio		*bio)
 {
 	struct iomap_ioend	*ioend = iomap_ioend_from_bio(bio);
+	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
 	int			error = blk_status_to_errno(bio->bi_status);
+
+	/*
+	 * If we have fsverity and block device integrity attached to this bio,
+	 * we need to run fsverity verification of data folios from a separate
+	 * fsverity workqueue. This is necessary to avoid deadlocking due to
+	 * fsverity issuing more reads of fsverity metadata which would be
+	 * processed by the same worker in the BIO completion workqueue.
+	 *
+	 * Without block device integrity, fsverity metadata IO will not use
+	 * ioends for completion.
+	 */
+	if (IS_ENABLED(CONFIG_FS_VERITY) && !error && ioend->io_vi &&
+			xfs_fsverity_is_file_data(ip, ioend->io_offset)) {
+		if (ioend->io_flags & IOMAP_IOEND_INTEGRITY) {
+			fsverity_enqueue_verify_work(&ioend->io_work);
+			return;
+		}
+
+		fsverity_verify_bio(ioend->io_vi, &ioend->io_bio);
+		error = blk_status_to_errno(ioend->io_bio.bi_status);
+	}
 
 	iomap_finish_ioends(ioend, error);
 }
@@ -33,9 +73,15 @@ xfs_ioend_submit_read(
 	struct inode		*inode,
 	struct bio		*bio,
 	loff_t			file_offset,
-	u16			ioend_flags)
+	u16			ioend_flags,
+	struct fsverity_info	*vi)
 {
-	iomap_init_ioend(inode, bio, file_offset, ioend_flags);
+	struct iomap_ioend	*ioend;
+
+	ioend = iomap_init_ioend(inode, bio, file_offset, ioend_flags);
+	ioend->io_vi = vi;
+	INIT_WORK(&ioend->io_work, xfs_end_fsverity_io_read);
+
 	if (ioend_flags & IOMAP_IOEND_INTEGRITY)
 		fs_bio_integrity_alloc(bio);
 	bio->bi_end_io = xfs_end_io_read;
