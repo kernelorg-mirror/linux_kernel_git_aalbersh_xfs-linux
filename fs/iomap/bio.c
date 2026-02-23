@@ -11,14 +11,22 @@
 static DEFINE_SPINLOCK(failed_read_lock);
 static struct bio_list failed_read_list = BIO_EMPTY_LIST;
 
-static void __iomap_read_end_io(struct bio *bio)
+static u32 __iomap_read_end_io(struct bio *bio, int error)
 {
-	int error = blk_status_to_errno(bio->bi_status);
 	struct folio_iter fi;
+	u32 folio_count = 0;
 
-	bio_for_each_folio_all(fi, bio)
+	bio_for_each_folio_all(fi, bio) {
 		iomap_finish_folio_read(fi.folio, fi.offset, fi.length, error);
+		folio_count++;
+	}
 	bio_put(bio);
+	return folio_count;
+}
+
+u32 iomap_finish_ioend_buffered_read(struct iomap_ioend *ioend)
+{
+	return __iomap_read_end_io(&ioend->io_bio, ioend->io_error);
 }
 
 static void
@@ -34,7 +42,7 @@ iomap_fail_reads(
 	spin_unlock_irqrestore(&failed_read_lock, flags);
 
 	while ((bio = bio_list_pop(&tmp)) != NULL) {
-		__iomap_read_end_io(bio);
+		__iomap_read_end_io(bio, blk_status_to_errno(bio->bi_status));
 		cond_resched();
 	}
 }
@@ -64,7 +72,7 @@ static void iomap_read_end_io(struct bio *bio)
 		return;
 	}
 
-	__iomap_read_end_io(bio);
+	__iomap_read_end_io(bio, blk_status_to_errno(bio->bi_status));
 }
 
 static void iomap_bio_submit_read(const struct iomap_iter *iter,
