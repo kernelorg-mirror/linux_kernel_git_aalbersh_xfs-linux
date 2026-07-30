@@ -6145,14 +6145,11 @@ xfs_bmap_validate_extent(
 }
 
 /*
- * Used in xfs_itruncate_extents().  This is the maximum number of extents
- * freed from a file in a single transaction.
- */
-#define	XFS_ITRUNC_MAX_EXTENTS	2
-
-/*
  * Unmap every extent in part of an inode's fork.  We don't do any higher level
  * invalidation work at all.
+ *
+ * The XFS_BMAPI_UNWRITTEN could be passed to remove only unwritten extents,
+ * leaving out normal extents in place.
  */
 int
 xfs_bunmapi_range(
@@ -6162,23 +6159,51 @@ xfs_bunmapi_range(
 	xfs_fileoff_t		startoff,
 	xfs_fileoff_t		endoff)
 {
-	xfs_filblks_t		unmap_len = endoff - startoff + 1;
+	xfs_filblks_t           unmap_len;
 	int			error = 0;
+	int			nimaps = 1;
+	int			done = 0;
+	struct xfs_bmbt_irec	imap;
+	int			read_flags =
+			flags & (XFS_BMAPI_ATTRFORK | XFS_BMAPI_ENTIRE);
 
 	xfs_assert_ilocked(ip, XFS_ILOCK_EXCL);
 
-	while (unmap_len > 0) {
-		ASSERT((*tpp)->t_highest_agno == NULLAGNUMBER);
-		error = __xfs_bunmapi(*tpp, ip, startoff, &unmap_len, flags,
-				XFS_ITRUNC_MAX_EXTENTS);
+	while (startoff < endoff) {
+		nimaps = 1;
+
+		error = xfs_bmapi_read(ip, startoff, endoff - startoff + 1,
+				&imap, &nimaps, read_flags);
 		if (error)
 			goto out;
 
-		/* free the just unmapped extents */
-		error = xfs_defer_finish(tpp);
-		if (error)
+		if (nimaps == 0)
 			goto out;
-		cond_resched();
+
+		if ((flags & XFS_BMAPI_UNWRITTEN) &&
+				imap.br_state != XFS_EXT_UNWRITTEN) {
+			startoff = imap.br_startoff + imap.br_blockcount;
+			continue;
+		}
+
+		unmap_len = min(endoff - imap.br_startoff + 1,
+				imap.br_blockcount);
+		done = 0;
+		while (!done) {
+			ASSERT((*tpp)->t_highest_agno == NULLAGNUMBER);
+			error = xfs_bunmapi(*tpp, ip, imap.br_startoff,
+					unmap_len, flags, nimaps, &done);
+			if (error)
+				goto out;
+
+			/* free the just unmapped extent */
+			error = xfs_defer_finish(tpp);
+			if (error)
+				goto out;
+			cond_resched();
+		}
+
+		startoff = imap.br_startoff + unmap_len;
 	}
 out:
 	return error;
